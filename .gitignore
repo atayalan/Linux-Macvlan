@@ -60,3 +60,5 @@ dkms.conf
 # Devspace
 .devspace
 .vscode
+
+tags
