@@ -10,6 +10,7 @@
  * ---
  */
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -28,7 +29,9 @@
 #include <linux/if_macvlan.h>
 #include <linux/hash.h>
 #include <linux/workqueue.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 #include <net/netdev_lock.h>
+#endif
 #include <net/rtnetlink.h>
 #include <net/xfrm.h>
 #include <linux/netpoll.h>
@@ -166,7 +169,11 @@ static int macvlan_hash_add_source(struct macvlan_dev *vlan,
 	if (entry)
 		return 0;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+#else
 	entry = kmalloc_obj(*entry);
+#endif
 	if (!entry)
 		return -ENOMEM;
 
@@ -231,22 +238,37 @@ static bool macvlan_addr_busy(const struct macvlan_port *port,
 }
 
 
+/* Ataya: BESS runs XDP on the macvlan devices named xdp* and needs the
+ * 802.1Q tag that RX VLAN offload moved into skb metadata, so put it back
+ * into the packet for those devices. Other macvlan devices keep the stock
+ * behavior, so VLAN subinterfaces in pods and VPP af_packet still see one
+ * tag. Inline because it runs for every received frame.
+ */
+static __always_inline void ataya_vlan_restore(struct sk_buff *skb,
+					       const struct net_device *dev)
+{
+	int ret;
+
+	if (likely(!skb_vlan_tag_present(skb)) || !strstr(dev->name, "xdp"))
+		return;
+
+	skb_reset_network_header(skb);
+	if (!skb_transport_header_was_set(skb))
+		skb_reset_transport_header(skb);
+	skb_push(skb, ETH_HLEN);
+	skb_reset_mac_header(skb);
+	ret = skb_vlan_push(skb, skb->vlan_proto, skb->vlan_tci);
+	if (unlikely(ret))
+		net_warn_ratelimited("%s: VLAN tag restore failed: %d\n",
+				     dev->name, ret);
+}
+
 static int macvlan_broadcast_one(struct sk_buff *skb,
 				 const struct macvlan_dev *vlan,
 				 const struct ethhdr *eth, bool local)
 {
 	struct net_device *dev = vlan->dev;
 
-	if (skb_vlan_tag_present(skb)) {
-		skb_push(skb, sizeof(struct ethhdr));
-		skb_reset_network_header(skb);
-		if (!skb_transport_header_was_set(skb))
-			skb_reset_transport_header(skb);
-		skb_reset_mac_header(skb);
-		skb_vlan_push(skb, skb->vlan_proto, skb->vlan_tci);
-		eth = eth_hdr(skb);
-	}
-
 	if (local)
 		return __dev_forward_skb(dev, skb);
 
@@ -256,24 +278,7 @@ static int macvlan_broadcast_one(struct sk_buff *skb,
 	else
 		skb->pkt_type = PACKET_MULTICAST;
 
-	return 0;
-}
-
-static int macvlan_broadcast_one_xmit(struct sk_buff *skb,
-				      const struct macvlan_dev *vlan,
-				      const struct ethhdr *eth, bool local)
-{
-	struct net_device *dev = vlan->dev;
-
-	if (local)
-		return __dev_forward_skb(dev, skb);
-
-	skb->dev = dev;
-	if (ether_addr_equal_64bits(eth->h_dest, dev->broadcast))
-		skb->pkt_type = PACKET_BROADCAST;
-	else
-		skb->pkt_type = PACKET_MULTICAST;
-
+	ataya_vlan_restore(skb, dev);
 	return 0;
 }
 
@@ -286,7 +291,11 @@ static u32 macvlan_hash_mix(const struct macvlan_dev *vlan)
 static unsigned int mc_hash(const struct macvlan_dev *vlan,
 			    const unsigned char *addr)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	u32 val = __get_unaligned_cpu32(addr + 2);
+#else
 	u32 val = get_unaligned((u32 *)(addr + 2));
+#endif
 
 	val ^= macvlan_hash_mix(vlan);
 	return hash_32(val, MACVLAN_MC_FILTER_BITS);
@@ -348,40 +357,7 @@ static void macvlan_multicast_rx(const struct macvlan_port *port,
 		 * already saw the frame on the way out.
 		 */
 		macvlan_broadcast(skb, port, src->dev,
-			  MACVLAN_MODE_VEPA);
-}
-
-static void macvlan_broadcast_xmit(struct sk_buff *skb,
-				   const struct macvlan_port *port,
-				   struct net_device *src,
-				   enum macvlan_mode mode)
-{
-	const struct ethhdr *eth = eth_hdr(skb);
-	const struct macvlan_dev *vlan;
-	struct sk_buff *nskb;
-	unsigned int i, hash;
-	int err;
-
-	if (skb->protocol == htons(ETH_P_PAUSE))
-		return;
-
-	hash_for_each_rcu(port->vlan_hash, i, vlan, hlist) {
-		if (vlan->dev == src || !(vlan->mode & mode))
-			continue;
-
-		hash = mc_hash(vlan, eth->h_dest);
-		if (!test_bit(hash, vlan->mc_filter))
-			continue;
-
-		err = NET_RX_DROP;
-		nskb = skb_clone(skb, GFP_ATOMIC);
-		if (likely(nskb))
-			err = macvlan_broadcast_one_xmit(nskb, vlan, eth,
-							mode == MACVLAN_MODE_BRIDGE) ?:
-				  netif_rx(nskb);
-		macvlan_count_rx(vlan, skb->len + ETH_HLEN,
-				 err == NET_RX_SUCCESS, true);
-	}
+				  MACVLAN_MODE_VEPA);
 }
 
 static void macvlan_process_broadcast(struct work_struct *w)
@@ -416,6 +392,7 @@ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
 				      const struct macvlan_dev *src,
 				      struct sk_buff *skb)
 {
+	u32 bc_queue_len_used = READ_ONCE(port->bc_queue_len_used);
 	struct sk_buff *nskb;
 	int err = -ENOMEM;
 
@@ -426,7 +403,7 @@ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
 	MACVLAN_SKB_CB(nskb)->src = src;
 
 	spin_lock(&port->bc_queue.lock);
-	if (skb_queue_len(&port->bc_queue) < port->bc_queue_len_used) {
+	if (skb_queue_len(&port->bc_queue) < bc_queue_len_used) {
 		if (src)
 			dev_hold(src->dev);
 		__skb_queue_tail(&port->bc_queue, nskb);
@@ -434,7 +411,11 @@ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
 	}
 	spin_unlock(&port->bc_queue.lock);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	queue_work(system_unbound_wq, &port->bc_work);
+#else
 	queue_work(system_dfl_wq, &port->bc_work);
+#endif
 
 	if (err)
 		goto free_nskb;
@@ -483,15 +464,7 @@ static void macvlan_forward_source_one(struct sk_buff *skb,
 	if (ether_addr_equal_64bits(eth_hdr(skb)->h_dest, dev->dev_addr))
 		nskb->pkt_type = PACKET_HOST;
 
-	if (skb_vlan_tag_present(nskb)) {
-		skb_push(nskb, sizeof(struct ethhdr));
-		skb_reset_network_header(nskb);
-		if (!skb_transport_header_was_set(nskb))
-			skb_reset_transport_header(nskb);
-		skb_reset_mac_header(nskb);
-		skb_vlan_push(nskb, nskb->vlan_proto, nskb->vlan_tci);
-	}
-
+	ataya_vlan_restore(nskb, dev);
 	ret = __netif_rx(nskb);
 	macvlan_count_rx(vlan, len, ret == NET_RX_SUCCESS, false);
 }
@@ -597,17 +570,10 @@ static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
 	}
 
 	*pskb = skb;
-		skb->dev = dev;
-		skb->pkt_type = PACKET_HOST;
-	if (skb_vlan_tag_present(skb)) {
-		skb_push(skb, sizeof(struct ethhdr));
-		skb_reset_network_header(skb);
-		if (!skb_transport_header_was_set(skb))
-			skb_reset_transport_header(skb);
-		skb_reset_mac_header(skb);
-		skb_vlan_push(skb, skb->vlan_proto, skb->vlan_tci);
-	}
+	skb->dev = dev;
+	skb->pkt_type = PACKET_HOST;
 
+	ataya_vlan_restore(skb, dev);
 	ret = NET_RX_SUCCESS;
 	handle_res = RX_HANDLER_ANOTHER;
 out:
@@ -627,7 +593,7 @@ static int macvlan_queue_xmit(struct sk_buff *skb, struct net_device *dev)
 		/* send to other bridge ports directly */
 		if (is_multicast_ether_addr(eth->h_dest)) {
 			skb_reset_mac_header(skb);
-			macvlan_broadcast_xmit(skb, port, dev, MACVLAN_MODE_BRIDGE);
+			macvlan_broadcast(skb, port, dev, MACVLAN_MODE_BRIDGE);
 			goto xmit_world;
 		}
 
@@ -841,13 +807,25 @@ static int macvlan_sync_address(struct net_device *dev,
 static int macvlan_set_mac_address(struct net_device *dev, void *p)
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	struct sockaddr *addr = p;
+#else
 	struct sockaddr_storage *addr = p;
+#endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	if (!is_valid_ether_addr(addr->sa_data))
+#else
 	if (!is_valid_ether_addr(addr->__data))
+#endif
 		return -EADDRNOTAVAIL;
 
 	/* If the addresses are the same, this is a no-op */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	if (ether_addr_equal(dev->dev_addr, addr->sa_data))
+#else
 	if (ether_addr_equal(dev->dev_addr, addr->__data))
+#endif
 		return 0;
 
 	if (vlan->mode == MACVLAN_MODE_PASSTHRU) {
@@ -855,10 +833,18 @@ static int macvlan_set_mac_address(struct net_device *dev, void *p)
 		return dev_set_mac_address(vlan->lowerdev, addr, NULL);
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	if (macvlan_addr_busy(vlan->port, addr->sa_data))
+#else
 	if (macvlan_addr_busy(vlan->port, addr->__data))
+#endif
 		return -EADDRINUSE;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	return macvlan_sync_address(dev, addr->sa_data);
+#else
 	return macvlan_sync_address(dev, addr->__data);
+#endif
 }
 
 static void macvlan_change_rx_flags(struct net_device *dev, int change)
@@ -953,7 +939,11 @@ static int macvlan_change_mtu(struct net_device *dev, int new_mtu)
 
 	if (vlan->lowerdev->mtu < new_mtu)
 		return -EINVAL;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	dev->mtu = new_mtu;
+#else
 	WRITE_ONCE(dev->mtu, new_mtu);
+#endif
 	return 0;
 }
 
@@ -988,7 +978,11 @@ static struct lock_class_key macvlan_netdev_addr_lock_key;
 	(NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_GSO_SOFTWARE | \
 	 NETIF_F_GSO_ROBUST | NETIF_F_GSO_ENCAP_ALL)
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+#define ALWAYS_ON_FEATURES (ALWAYS_ON_OFFLOADS | NETIF_F_LLTX)
+#else
 #define ALWAYS_ON_FEATURES ALWAYS_ON_OFFLOADS
+#endif
 
 #define MACVLAN_FEATURES \
 	(NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST | \
@@ -1020,9 +1014,13 @@ static int macvlan_init(struct net_device *dev)
 	dev->vlan_features	= lowerdev->vlan_features & MACVLAN_FEATURES;
 	dev->vlan_features	|= ALWAYS_ON_OFFLOADS;
 	dev->hw_enc_features    |= dev->features;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	dev->lltx		= true;
+#endif
 	netif_inherit_tso_max(dev, lowerdev);
 	dev->hard_header_len	= lowerdev->hard_header_len;
+	dev->needed_headroom	= lowerdev->needed_headroom;
+	dev->needed_tailroom	= lowerdev->needed_tailroom;
 	macvlan_set_lockdep_class(dev);
 
 	vlan->pcpu_stats = netdev_alloc_pcpu_stats(struct vlan_pcpu_stats);
@@ -1112,7 +1110,11 @@ static int macvlan_vlan_rx_kill_vid(struct net_device *dev,
 static int macvlan_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 			   struct net_device *dev,
 			   const unsigned char *addr, u16 vid,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+			   u16 flags,
+#else
 			   u16 flags, bool *notified,
+#endif
 			   struct netlink_ext_ack *extack)
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
@@ -1137,7 +1139,11 @@ static int macvlan_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 
 static int macvlan_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
 			   struct net_device *dev,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+			   const unsigned char *addr, u16 vid,
+#else
 			   const unsigned char *addr, u16 vid, bool *notified,
+#endif
 			   struct netlink_ext_ack *extack)
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
@@ -1173,7 +1179,11 @@ static int macvlan_ethtool_get_link_ksettings(struct net_device *dev,
 }
 
 static int macvlan_ethtool_get_ts_info(struct net_device *dev,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+				       struct ethtool_ts_info *info)
+#else
 				       struct kernel_ethtool_ts_info *info)
+#endif
 {
 	struct net_device *real_dev = macvlan_dev_real_dev(dev);
 
@@ -1205,14 +1215,22 @@ static void macvlan_dev_poll_controller(struct net_device *dev)
 	return;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+static int macvlan_dev_netpoll_setup(struct net_device *dev, struct netpoll_info *npinfo)
+#else
 static int macvlan_dev_netpoll_setup(struct net_device *dev)
+#endif
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
 	struct net_device *real_dev = vlan->lowerdev;
 	struct netpoll *netpoll;
 	int err;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	netpoll = kzalloc(sizeof(*netpoll), GFP_KERNEL);
+#else
 	netpoll = kzalloc_obj(*netpoll);
+#endif
 	err = -ENOMEM;
 	if (!netpoll)
 		goto out;
@@ -1247,7 +1265,11 @@ static int macvlan_dev_get_iflink(const struct net_device *dev)
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	return vlan->lowerdev->ifindex;
+#else
 	return READ_ONCE(vlan->lowerdev->ifindex);
+#endif
 }
 
 static const struct ethtool_ops macvlan_ethtool_ops = {
@@ -1302,8 +1324,12 @@ void macvlan_common_setup(struct net_device *dev)
 	dev->max_mtu		= ETH_MAX_MTU;
 	dev->priv_flags	       &= ~IFF_TX_SKB_SHARING;
 	netif_keep_dst(dev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	dev->priv_flags	       |= IFF_UNICAST_FLT | IFF_CHANGE_PROTO_DOWN;
+#else
 	dev->priv_flags	       |= IFF_UNICAST_FLT;
 	dev->change_proto_down	= true;
+#endif
 	dev->netdev_ops		= &macvlan_netdev_ops;
 	dev->needs_free_netdev	= true;
 	dev->priv_destructor	= macvlan_dev_free;
@@ -1330,7 +1356,11 @@ static int macvlan_port_create(struct net_device *dev)
 	if (netdev_is_rx_handler_busy(dev))
 		return -EBUSY;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	port = kzalloc(sizeof(*port), GFP_KERNEL);
+#else
 	port = kzalloc_obj(*port);
+#endif
 	if (port == NULL)
 		return -ENOMEM;
 
@@ -1382,11 +1412,21 @@ static void macvlan_port_destroy(struct net_device *dev)
 	 */
 	if (macvlan_passthru(port) &&
 	    !ether_addr_equal(port->dev->dev_addr, port->perm_addr)) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+		struct sockaddr sa;
+#else
 		struct sockaddr_storage ss;
+#endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+		sa.sa_family = port->dev->type;
+		memcpy(&sa.sa_data, port->perm_addr, port->dev->addr_len);
+		dev_set_mac_address(port->dev, &sa, NULL);
+#else
 		ss.ss_family = port->dev->type;
 		memcpy(&ss.__data, port->perm_addr, port->dev->addr_len);
 		dev_set_mac_address(port->dev, &ss, NULL);
+#endif
 	}
 
 	kfree(port);
@@ -1528,14 +1568,23 @@ static int macvlan_changelink_sources(struct macvlan_dev *vlan, u32 mode,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+int macvlan_common_newlink(struct net *src_net, struct net_device *dev,
+			   struct nlattr *tb[], struct nlattr *data[],
+#else
 int macvlan_common_newlink(struct net_device *dev,
 			   struct rtnl_newlink_params *params,
+#endif
 			   struct netlink_ext_ack *extack)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	struct net *link_net = rtnl_newlink_link_net(params);
-	struct macvlan_dev *vlan = netdev_priv(dev);
 	struct nlattr **data = params->data;
 	struct nlattr **tb = params->tb;
+#else
+	struct net *link_net = src_net;
+#endif
+	struct macvlan_dev *vlan = netdev_priv(dev);
 	struct net_device *lowerdev;
 	struct macvlan_port *port;
 	bool create = false;
@@ -1662,11 +1711,20 @@ destroy_macvlan_port:
 }
 EXPORT_SYMBOL_GPL(macvlan_common_newlink);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+static int macvlan_newlink(struct net *src_net, struct net_device *dev,
+			   struct nlattr *tb[], struct nlattr *data[],
+#else
 static int macvlan_newlink(struct net_device *dev,
 			   struct rtnl_newlink_params *params,
+#endif
 			   struct netlink_ext_ack *extack)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+	return macvlan_common_newlink(src_net, dev, tb, data, extack);
+#else
 	return macvlan_common_newlink(dev, params, extack);
+#endif
 }
 
 void macvlan_dellink(struct net_device *dev, struct list_head *head)
@@ -1762,6 +1820,7 @@ static size_t macvlan_get_size(const struct net_device *dev)
 		+ macvlan_get_size_mac(vlan) /* IFLA_MACVLAN_MACADDR */
 		+ nla_total_size(4) /* IFLA_MACVLAN_BC_QUEUE_LEN */
 		+ nla_total_size(4) /* IFLA_MACVLAN_BC_QUEUE_LEN_USED */
+		+ nla_total_size(4) /* IFLA_MACVLAN_BC_CUTOFF */
 		);
 }
 
@@ -1808,7 +1867,8 @@ static int macvlan_fill_info(struct sk_buff *skb,
 	}
 	if (nla_put_u32(skb, IFLA_MACVLAN_BC_QUEUE_LEN, vlan->bc_queue_len_req))
 		goto nla_put_failure;
-	if (nla_put_u32(skb, IFLA_MACVLAN_BC_QUEUE_LEN_USED, port->bc_queue_len_used))
+	if (nla_put_u32(skb, IFLA_MACVLAN_BC_QUEUE_LEN_USED,
+			READ_ONCE(port->bc_queue_len_used)))
 		goto nla_put_failure;
 	if (port->bc_cutoff != 1 &&
 	    nla_put_s32(skb, IFLA_MACVLAN_BC_CUTOFF, port->bc_cutoff))
@@ -1868,7 +1928,7 @@ static void update_port_bc_queue_len(struct macvlan_port *port)
 		if (vlan->bc_queue_len_req > max_bc_queue_len_req)
 			max_bc_queue_len_req = vlan->bc_queue_len_req;
 	}
-	port->bc_queue_len_used = max_bc_queue_len_req;
+	WRITE_ONCE(port->bc_queue_len_used, max_bc_queue_len_req);
 }
 
 static int macvlan_device_event(struct notifier_block *unused,
@@ -1895,6 +1955,8 @@ static int macvlan_device_event(struct notifier_block *unused,
 	case NETDEV_FEAT_CHANGE:
 		list_for_each_entry(vlan, &port->vlans, list) {
 			netif_inherit_tso_max(vlan->dev, dev);
+			vlan->dev->needed_headroom = dev->needed_headroom;
+			vlan->dev->needed_tailroom = dev->needed_tailroom;
 			netdev_update_features(vlan->dev);
 		}
 		break;
